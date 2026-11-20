@@ -1,0 +1,797 @@
+import { env, SELF } from "cloudflare:test";
+import { beforeAll, describe, expect, it } from "vitest";
+
+import { createAuth } from "../../../worker/auth/auth";
+import { applyCurrentMigrations } from "./current-migrations";
+
+const origin = "https://hqbase.test";
+let ownerCookie = "";
+
+describe("workspace user onboarding", () => {
+  beforeAll(async () => {
+    await applyCurrentMigrations();
+
+    const owner = await createAuth(env, new Request(`${origin}/api/auth/sign-up/email`)).handler(
+      new Request(`${origin}/api/auth/sign-up/email`, {
+        body: JSON.stringify({
+          email: "owner@login.example",
+          name: "Workspace Owner",
+          password: "owner-password-123",
+          rememberMe: false
+        }),
+        headers: { "content-type": "application/json", origin },
+        method: "POST"
+      })
+    );
+    expect(owner.status, await owner.clone().text()).toBe(200);
+    ownerCookie = extractSessionCookie(owner);
+    await env.DB.prepare(
+      `UPDATE "user" SET role = 'owner' WHERE email = 'owner@login.example'`
+    ).run();
+
+    const timestamp = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO mail_domains
+         (id, name, receiving_status, sending_status, dns_status, is_enabled, created_at, updated_at)
+         VALUES ('domain_users', 'example.com', 'ready', 'ready', 'ready', 1, ?, ?)`
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO mailboxes
+         (id, address, mail_domain_id, display_name, is_active, created_at, updated_at)
+         VALUES ('mailbox_users', 'support@example.com', 'domain_users', 'Support', 1, ?, ?)`
+      ).bind(timestamp, timestamp)
+    ]);
+  });
+
+  it("generates a temporary password and denies workspace APIs until it is replaced", async () => {
+    const created = await createUser({
+      email: "direct-user@gmail.com",
+      method: "temporary_password",
+      name: "Direct User",
+      role: "member"
+    });
+    expect(created.status, await created.clone().text()).toBe(201);
+    const result = (await created.json()) as {
+      temporaryPassword: string;
+      user: { id: string; passwordSetupRequired: boolean };
+    };
+    expect(result.temporaryPassword).toMatch(/^Hq![A-Za-z0-9_-]{24}$/);
+    expect(result.user.passwordSetupRequired).toBe(true);
+
+    const account = await env.DB.prepare(
+      "SELECT password FROM account WHERE userId = ? AND providerId = 'credential'"
+    )
+      .bind(result.user.id)
+      .first<{ password: string }>();
+    expect(account?.password).not.toBe(result.temporaryPassword);
+
+    const memberCookie = await signIn("direct-user@gmail.com", result.temporaryPassword);
+    const meBefore = await SELF.fetch(`${origin}/api/me`, {
+      headers: { origin, cookie: memberCookie }
+    });
+    await expect(meBefore.json()).resolves.toMatchObject({ passwordSetupRequired: true });
+
+    const blocked = await SELF.fetch(`${origin}/api/mailboxes`, {
+      headers: { origin, cookie: memberCookie }
+    });
+    expect(blocked.status).toBe(403);
+    await expect(blocked.json()).resolves.toMatchObject({
+      error: { code: "PASSWORD_SETUP_REQUIRED" }
+    });
+
+    const changed = await SELF.fetch(`${origin}/api/me/password`, {
+      body: JSON.stringify({
+        confirmPassword: "member-chosen-password-456",
+        currentPassword: result.temporaryPassword,
+        newPassword: "member-chosen-password-456"
+      }),
+      headers: { "content-type": "application/json", cookie: memberCookie, origin },
+      method: "POST"
+    });
+    expect(changed.status, await changed.clone().text()).toBe(200);
+    const refreshedCookie = extractSessionCookie(changed);
+
+    const meAfter = await SELF.fetch(`${origin}/api/me`, {
+      headers: { origin, cookie: refreshedCookie }
+    });
+    await expect(meAfter.json()).resolves.toMatchObject({ passwordSetupRequired: false });
+    const allowed = await SELF.fetch(`${origin}/api/mailboxes`, {
+      headers: { origin, cookie: refreshedCookie }
+    });
+    expect(allowed.status, await allowed.clone().text()).toBe(200);
+  });
+
+  it("keeps Login email domains separate from workspace email domains in both directions", async () => {
+    const managedLogin = await createUser({
+      email: "person@example.com",
+      method: "temporary_password",
+      name: "Managed Domain User",
+      role: "member"
+    });
+    expect(managedLogin.status).toBe(409);
+    await expect(managedLogin.json()).resolves.toMatchObject({
+      error: { code: "LOGIN_EMAIL_DOMAIN_MANAGED" }
+    });
+    const rejectedUser = await env.DB.prepare('SELECT id FROM "user" WHERE email = ?')
+      .bind("person@example.com")
+      .first();
+    expect(rejectedUser).toBeNull();
+
+    const futureDomainUser = await createUser({
+      email: "person@future.example",
+      method: "temporary_password",
+      name: "Future Domain User",
+      role: "member"
+    });
+    expect(futureDomainUser.status, await futureDomainUser.clone().text()).toBe(201);
+
+    const domain = await SELF.fetch(`${origin}/api/domains`, {
+      body: JSON.stringify({ name: "future.example" }),
+      headers: { "content-type": "application/json", cookie: ownerCookie, origin },
+      method: "POST"
+    });
+    expect(domain.status).toBe(409);
+    await expect(domain.json()).resolves.toMatchObject({
+      error: { code: "DOMAIN_USED_BY_LOGIN_EMAIL" }
+    });
+    const rejectedDomain = await env.DB.prepare("SELECT id FROM mail_domains WHERE name = ?")
+      .bind("future.example")
+      .first();
+    expect(rejectedDomain).toBeNull();
+
+    const longNestedDomain = `${"second-".padEnd(45, "a")}.future.example`;
+    const acceptedDomain = await SELF.fetch(`${origin}/api/domains`, {
+      body: JSON.stringify({ name: longNestedDomain }),
+      headers: { "content-type": "application/json", cookie: ownerCookie, origin },
+      method: "POST"
+    });
+    expect(acceptedDomain.status, await acceptedDomain.clone().text()).toBe(201);
+  });
+
+  it("regenerates a lost temporary password only while setup is pending", async () => {
+    const created = await createUser({
+      email: "regenerated-user@gmail.com",
+      method: "temporary_password",
+      name: "Regenerated User",
+      role: "member"
+    });
+    const initial = (await created.json()) as {
+      temporaryPassword: string;
+      user: { id: string };
+    };
+
+    const regenerated = await SELF.fetch(
+      `${origin}/api/users/${initial.user.id}/temporary-password`,
+      { headers: { origin, cookie: ownerCookie }, method: "POST" }
+    );
+    expect(regenerated.status, await regenerated.clone().text()).toBe(200);
+    const next = (await regenerated.json()) as { temporaryPassword: string };
+    expect(next.temporaryPassword).not.toBe(initial.temporaryPassword);
+
+    await expect(signIn("regenerated-user@gmail.com", initial.temporaryPassword)).rejects.toThrow();
+    await expect(signIn("regenerated-user@gmail.com", next.temporaryPassword)).resolves.toContain(
+      "better-auth.session_token"
+    );
+  });
+
+  it("creates a passwordless invite and activates it through the single-use setup token", async () => {
+    const created = await createUser({
+      email: "invited-user@gmail.com",
+      method: "email_invite",
+      name: "Invited User",
+      role: "member"
+    });
+    expect(created.status, await created.clone().text()).toBe(201);
+    const result = (await created.json()) as {
+      temporaryPassword?: string;
+      user: { id: string; invitationSentAt: string | null; passwordSetupRequired: boolean };
+    };
+    expect(result.temporaryPassword).toBeUndefined();
+    expect(result.user.invitationSentAt).not.toBeNull();
+    expect(result.user.passwordSetupRequired).toBe(true);
+
+    const credential = await env.DB.prepare(
+      "SELECT id FROM account WHERE userId = ? AND providerId = 'credential'"
+    )
+      .bind(result.user.id)
+      .first();
+    expect(credential).toBeNull();
+
+    const verification = await env.DB.prepare(
+      `SELECT identifier, expiresAt FROM verification
+       WHERE value = ? AND identifier LIKE 'reset-password:%'`
+    )
+      .bind(result.user.id)
+      .first<{ identifier: string; expiresAt: string }>();
+    const firstToken = verification?.identifier.replace("reset-password:", "");
+    expect(firstToken).toBeTruthy();
+    const invitationLifetimeMs = new Date(verification?.expiresAt ?? 0).getTime() - Date.now();
+    expect(invitationLifetimeMs).toBeGreaterThan(6 * 24 * 60 * 60 * 1000);
+    expect(invitationLifetimeMs).toBeLessThanOrEqual(7 * 24 * 60 * 60 * 1000);
+
+    const resent = await SELF.fetch(`${origin}/api/users/${result.user.id}/resend-invitation`, {
+      headers: { origin, cookie: ownerCookie },
+      method: "POST"
+    });
+    expect(resent.status, await resent.clone().text()).toBe(200);
+    const latestVerification = await env.DB.prepare(
+      `SELECT identifier FROM verification
+       WHERE value = ? AND identifier LIKE 'reset-password:%'`
+    )
+      .bind(result.user.id)
+      .first<{ identifier: string }>();
+    const resentToken = latestVerification?.identifier.replace("reset-password:", "");
+    expect(resentToken).toBeTruthy();
+    expect(resentToken).not.toBe(firstToken);
+
+    const invalidated = await SELF.fetch(`${origin}/api/auth/reset-password`, {
+      body: JSON.stringify({
+        newPassword: "invalidated-invite-password",
+        token: firstToken
+      }),
+      headers: { "content-type": "application/json", origin },
+      method: "POST"
+    });
+    expect(invalidated.status).toBe(400);
+
+    const recoveryRequest = await requestPasswordReset(
+      "invited-user@gmail.com",
+      `${origin}/reset-password`
+    );
+    expect(recoveryRequest.status).toBe(200);
+    const recoveryVerification = await env.DB.prepare(
+      `SELECT identifier FROM verification
+       WHERE value = ? AND identifier LIKE 'reset-password:%'`
+    )
+      .bind(result.user.id)
+      .first<{ identifier: string }>();
+    const token = recoveryVerification?.identifier.replace("reset-password:", "");
+    expect(token).toBeTruthy();
+    expect(token).not.toBe(resentToken);
+
+    const staleResentLink = await SELF.fetch(`${origin}/api/auth/reset-password`, {
+      body: JSON.stringify({
+        newPassword: "stale-resent-invite-password",
+        token: resentToken
+      }),
+      headers: { "content-type": "application/json", origin },
+      method: "POST"
+    });
+    expect(staleResentLink.status).toBe(400);
+
+    const accepted = await SELF.fetch(`${origin}/api/auth/reset-password`, {
+      body: JSON.stringify({ newPassword: "invited-user-password-789", token }),
+      headers: { "content-type": "application/json", origin },
+      method: "POST"
+    });
+    expect(accepted.status, await accepted.clone().text()).toBe(200);
+
+    const onboarding = await env.DB.prepare(
+      "SELECT status, completed_at FROM user_onboarding WHERE user_id = ?"
+    )
+      .bind(result.user.id)
+      .first<{ status: string; completed_at: string | null }>();
+    expect(onboarding?.status).toBe("complete");
+    expect(onboarding?.completed_at).not.toBeNull();
+    const audit = await env.DB.prepare(
+      `SELECT outcome FROM audit_events
+       WHERE action = 'user.password.setup' AND resource_id = ?`
+    )
+      .bind(result.user.id)
+      .first<{ outcome: string }>();
+    expect(audit?.outcome).toBe("success");
+    const remainingTokens = await env.DB.prepare(
+      `SELECT COUNT(*) AS count FROM verification
+       WHERE value = ? AND identifier LIKE 'reset-password:%'`
+    )
+      .bind(result.user.id)
+      .first<{ count: number }>();
+    expect(remainingTokens?.count).toBe(0);
+    await expect(signIn("invited-user@gmail.com", "invited-user-password-789")).resolves.toContain(
+      "better-auth.session_token"
+    );
+
+    const replay = await SELF.fetch(`${origin}/api/auth/reset-password`, {
+      body: JSON.stringify({ newPassword: "replayed-password-000", token }),
+      headers: { "content-type": "application/json", origin },
+      method: "POST"
+    });
+    expect(replay.status).toBe(400);
+  });
+
+  it("recovers a pending temporary-password account and completes its setup", async () => {
+    const created = await createUser({
+      email: "pending-recovery-user@gmail.com",
+      method: "temporary_password",
+      name: "Pending Recovery User",
+      role: "member"
+    });
+    expect(created.status, await created.clone().text()).toBe(201);
+    const result = (await created.json()) as {
+      temporaryPassword: string;
+      user: { id: string };
+    };
+    const temporaryCookie = await signIn(
+      "pending-recovery-user@gmail.com",
+      result.temporaryPassword
+    );
+
+    const requested = await requestPasswordReset(
+      "pending-recovery-user@gmail.com",
+      `${origin}/reset-password`
+    );
+    expect(requested.status).toBe(200);
+    const verification = await env.DB.prepare(
+      `SELECT identifier FROM verification
+       WHERE value = ? AND identifier LIKE 'reset-password:%'`
+    )
+      .bind(result.user.id)
+      .first<{ identifier: string }>();
+    const token = verification?.identifier.replace("reset-password:", "");
+    expect(token).toBeTruthy();
+
+    const reset = await SELF.fetch(`${origin}/api/auth/reset-password`, {
+      body: JSON.stringify({ newPassword: "pending-recovery-password-123", token }),
+      headers: { "content-type": "application/json", origin },
+      method: "POST"
+    });
+    expect(reset.status, await reset.clone().text()).toBe(200);
+
+    const onboarding = await env.DB.prepare("SELECT status FROM user_onboarding WHERE user_id = ?")
+      .bind(result.user.id)
+      .first<{ status: string }>();
+    expect(onboarding?.status).toBe("complete");
+    const revoked = await SELF.fetch(`${origin}/api/me`, {
+      headers: { origin, cookie: temporaryCookie }
+    });
+    expect(revoked.status).toBe(401);
+    await expect(
+      signIn("pending-recovery-user@gmail.com", result.temporaryPassword)
+    ).rejects.toThrow();
+    await expect(
+      signIn("pending-recovery-user@gmail.com", "pending-recovery-password-123")
+    ).resolves.toContain("better-auth.session_token");
+
+    const audit = await env.DB.prepare(
+      `SELECT outcome FROM audit_events
+       WHERE action = 'user.password.setup' AND resource_id = ?
+       ORDER BY occurred_at DESC LIMIT 1`
+    )
+      .bind(result.user.id)
+      .first<{ outcome: string }>();
+    expect(audit?.outcome).toBe("success");
+  });
+
+  it("resets an established password without revealing account existence", async () => {
+    const created = await createUser({
+      email: "recovery-user@gmail.com",
+      method: "temporary_password",
+      name: "Recovery User",
+      role: "member"
+    });
+    expect(created.status, await created.clone().text()).toBe(201);
+    const result = (await created.json()) as {
+      temporaryPassword: string;
+      user: { id: string };
+    };
+
+    const temporaryCookie = await signIn("recovery-user@gmail.com", result.temporaryPassword);
+    const completed = await SELF.fetch(`${origin}/api/me/password`, {
+      body: JSON.stringify({
+        confirmPassword: "first-recovery-password-123",
+        currentPassword: result.temporaryPassword,
+        newPassword: "first-recovery-password-123"
+      }),
+      headers: { "content-type": "application/json", cookie: temporaryCookie, origin },
+      method: "POST"
+    });
+    expect(completed.status, await completed.clone().text()).toBe(200);
+    const activeCookie = extractSessionCookie(completed);
+
+    const resetDestination = new URL("/reset-password", origin);
+    resetDestination.searchParams.set("returnTo", "/device?user_code=ABCD-EFGH");
+    const existingRequest = await requestPasswordReset(
+      "recovery-user@gmail.com",
+      resetDestination.href
+    );
+    const missingRequest = await requestPasswordReset(
+      "missing-user@gmail.com",
+      resetDestination.href
+    );
+    expect(existingRequest.status).toBe(200);
+    expect(missingRequest.status).toBe(200);
+    await expect(existingRequest.json()).resolves.toEqual(await missingRequest.json());
+
+    const firstVerification = await env.DB.prepare(
+      `SELECT identifier FROM verification
+       WHERE value = ? AND identifier LIKE 'reset-password:%'
+       ORDER BY expiresAt DESC LIMIT 1`
+    )
+      .bind(result.user.id)
+      .first<{ identifier: string }>();
+    const firstToken = firstVerification?.identifier.replace("reset-password:", "");
+    expect(firstToken).toBeTruthy();
+
+    const nextRequest = await requestPasswordReset(
+      "recovery-user@gmail.com",
+      resetDestination.href
+    );
+    expect(nextRequest.status).toBe(200);
+    const verification = await env.DB.prepare(
+      `SELECT identifier FROM verification
+       WHERE value = ? AND identifier LIKE 'reset-password:%'`
+    )
+      .bind(result.user.id)
+      .first<{ identifier: string }>();
+    const token = verification?.identifier.replace("reset-password:", "");
+    expect(token).toBeTruthy();
+    expect(token).not.toBe(firstToken);
+
+    const staleReset = await SELF.fetch(`${origin}/api/auth/reset-password`, {
+      body: JSON.stringify({ newPassword: "stale-recovery-password", token: firstToken }),
+      headers: { "content-type": "application/json", origin },
+      method: "POST"
+    });
+    expect(staleReset.status).toBe(400);
+
+    const callback = await SELF.fetch(
+      `${origin}/api/auth/reset-password/${token}?callbackURL=${encodeURIComponent(resetDestination.href)}`,
+      { redirect: "manual" }
+    );
+    expect(callback.status).toBe(302);
+    const callbackLocation = new URL(callback.headers.get("location") ?? origin);
+    expect(callbackLocation.pathname).toBe("/reset-password");
+    expect(callbackLocation.searchParams.get("returnTo")).toBe("/device?user_code=ABCD-EFGH");
+    expect(callbackLocation.searchParams.get("token")).toBe(token);
+
+    const reset = await SELF.fetch(`${origin}/api/auth/reset-password`, {
+      body: JSON.stringify({ newPassword: "second-recovery-password-456", token }),
+      headers: { "content-type": "application/json", origin },
+      method: "POST"
+    });
+    expect(reset.status, await reset.clone().text()).toBe(200);
+
+    const revoked = await SELF.fetch(`${origin}/api/me`, {
+      headers: { origin, cookie: activeCookie }
+    });
+    expect(revoked.status).toBe(401);
+    await expect(
+      signIn("recovery-user@gmail.com", "first-recovery-password-123")
+    ).rejects.toThrow();
+    await expect(
+      signIn("recovery-user@gmail.com", "second-recovery-password-456")
+    ).resolves.toContain("better-auth.session_token");
+    const audit = await env.DB.prepare(
+      `SELECT outcome FROM audit_events
+       WHERE action = 'user.password.reset' AND resource_id = ?
+       ORDER BY occurred_at DESC LIMIT 1`
+    )
+      .bind(result.user.id)
+      .first<{ outcome: string }>();
+    expect(audit?.outcome).toBe("success");
+    const remainingTokens = await env.DB.prepare(
+      `SELECT COUNT(*) AS count FROM verification
+       WHERE value = ? AND identifier LIKE 'reset-password:%'`
+    )
+      .bind(result.user.id)
+      .first<{ count: number }>();
+    expect(remainingTokens?.count).toBe(0);
+  });
+
+  it("removes and restores a user without restoring access", async () => {
+    const created = await createUser({
+      email: "removed-user@gmail.com",
+      method: "temporary_password",
+      name: "Removed User",
+      role: "member"
+    });
+    expect(created.status, await created.clone().text()).toBe(201);
+    const result = (await created.json()) as {
+      temporaryPassword: string;
+      user: { id: string };
+    };
+    const userCookie = await signIn("removed-user@gmail.com", result.temporaryPassword);
+    const session = await env.DB.prepare("SELECT id FROM session WHERE userId = ?")
+      .bind(result.user.id)
+      .first<{ id: string }>();
+    const owner = await env.DB.prepare('SELECT id FROM "user" WHERE email = ?')
+      .bind("owner@login.example")
+      .first<{ id: string }>();
+    expect(session?.id).toBeTruthy();
+    expect(owner?.id).toBeTruthy();
+
+    const timestamp = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO mailbox_grants
+           (mailbox_id, principal_id, access_level, created_by_principal_id, created_at, updated_at)
+           VALUES ('mailbox_users', ?, 'read', ?, ?, ?)`
+      ).bind(result.user.id, owner?.id, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO push_subscriptions
+           (id, user_id, endpoint, p256dh_key, auth_key, created_at, updated_at)
+           VALUES ('push_removed_user', ?, 'https://push.example/removed-user', 'key', 'auth', ?, ?)`
+      ).bind(result.user.id, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO oauthClient (id, clientId, redirectUris, createdAt, updatedAt)
+           VALUES ('oauth_client_removed_user', 'client_removed_user', '["https://client.example/callback"]', ?, ?)`
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO oauthConsent
+           (id, clientId, userId, scopes, createdAt, updatedAt)
+           VALUES ('oauth_consent_removed_user', 'client_removed_user', ?, '["mail:read"]', ?, ?)`
+      ).bind(result.user.id, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO oauthRefreshToken
+           (id, token, clientId, sessionId, userId, expiresAt, createdAt, scopes)
+           VALUES ('oauth_refresh_removed_user', 'refresh_removed_user', 'client_removed_user', ?, ?, ?, ?, '["mail:read"]')`
+      ).bind(session?.id, result.user.id, expiresAt, timestamp),
+      env.DB.prepare(
+        `INSERT INTO oauthAccessToken
+           (id, token, clientId, sessionId, userId, refreshId, expiresAt, createdAt, scopes)
+           VALUES ('oauth_access_removed_user', 'access_removed_user', 'client_removed_user', ?, ?,
+                   'oauth_refresh_removed_user', ?, ?, '["mail:read"]')`
+      ).bind(session?.id, result.user.id, expiresAt, timestamp),
+      env.DB.prepare(
+        `INSERT INTO deviceCode
+           (id, deviceCode, userCode, userId, expiresAt, status)
+           VALUES ('device_removed_user', 'device-code-removed-user', 'REMOVE-USER', ?, ?, 'approved')`
+      ).bind(result.user.id, expiresAt),
+      env.DB.prepare(
+        `INSERT INTO verification
+           (id, identifier, value, expiresAt, createdAt, updatedAt)
+           VALUES ('verification_removed_user', 'reset-password:removed-user', ?, ?, ?, ?)`
+      ).bind(result.user.id, expiresAt, timestamp, timestamp)
+    ]);
+
+    const removed = await SELF.fetch(`${origin}/api/users/${result.user.id}`, {
+      headers: { origin, cookie: ownerCookie },
+      method: "DELETE"
+    });
+    expect(removed.status, await removed.clone().text()).toBe(204);
+
+    const removedState = await env.DB.prepare(
+      `SELECT user.banned, principal.status,
+              (SELECT COUNT(*) FROM session WHERE userId = user.id) AS sessions,
+              (SELECT COUNT(*) FROM mailbox_grants WHERE principal_id = user.id) AS grants,
+              (SELECT COUNT(*) FROM push_subscriptions WHERE user_id = user.id) AS subscriptions,
+              (SELECT COUNT(*) FROM oauthAccessToken WHERE userId = user.id) AS access_tokens,
+              (SELECT COUNT(*) FROM oauthRefreshToken WHERE userId = user.id) AS refresh_tokens,
+              (SELECT COUNT(*) FROM oauthConsent WHERE userId = user.id) AS consents,
+              (SELECT COUNT(*) FROM deviceCode WHERE userId = user.id) AS device_codes,
+              (SELECT COUNT(*) FROM verification
+               WHERE value = user.id AND identifier LIKE 'reset-password:%') AS verifications
+       FROM "user" user
+       JOIN principals principal ON principal.id = user.id
+       WHERE user.id = ?`
+    )
+      .bind(result.user.id)
+      .first<Record<string, number | string>>();
+    expect(removedState).toMatchObject({
+      banned: 1,
+      status: "disabled",
+      sessions: 0,
+      grants: 0,
+      subscriptions: 0,
+      access_tokens: 0,
+      refresh_tokens: 0,
+      consents: 0,
+      device_codes: 0,
+      verifications: 0
+    });
+    await expect(signIn("removed-user@gmail.com", result.temporaryPassword)).rejects.toThrow();
+    const revokedSession = await SELF.fetch(`${origin}/api/me`, {
+      headers: { origin, cookie: userCookie }
+    });
+    expect(revokedSession.status).toBe(401);
+
+    const listed = await SELF.fetch(`${origin}/api/users`, {
+      headers: { origin, cookie: ownerCookie }
+    });
+    const users = (await listed.json()) as Array<{ banned: boolean; id: string }>;
+    expect(users).toContainEqual(expect.objectContaining({ banned: true, id: result.user.id }));
+
+    const roleChange = await SELF.fetch(`${origin}/api/users/${result.user.id}`, {
+      body: JSON.stringify({ role: "admin" }),
+      headers: { origin, "content-type": "application/json", cookie: ownerCookie },
+      method: "PATCH"
+    });
+    expect(roleChange.status).toBe(409);
+    await expect(roleChange.json()).resolves.toMatchObject({
+      error: { code: "USER_REMOVED" }
+    });
+
+    const restored = await SELF.fetch(`${origin}/api/users/${result.user.id}/restore`, {
+      headers: { origin, cookie: ownerCookie },
+      method: "POST"
+    });
+    expect(restored.status, await restored.clone().text()).toBe(200);
+    const restoredState = await env.DB.prepare(
+      `SELECT user.banned, principal.status,
+              (SELECT COUNT(*) FROM mailbox_grants WHERE principal_id = user.id) AS grants
+       FROM "user" user
+       JOIN principals principal ON principal.id = user.id
+       WHERE user.id = ?`
+    )
+      .bind(result.user.id)
+      .first<{ banned: number; grants: number; status: string }>();
+    expect(restoredState).toEqual({ banned: 0, grants: 0, status: "active" });
+    await expect(signIn("removed-user@gmail.com", result.temporaryPassword)).resolves.toContain(
+      "better-auth.session_token"
+    );
+
+    const audits = await env.DB.prepare(
+      `SELECT action, outcome FROM audit_events
+       WHERE resource_type = 'user' AND resource_id = ?
+         AND action IN ('user.remove', 'user.restore')
+       ORDER BY occurred_at`
+    )
+      .bind(result.user.id)
+      .all<{ action: string; outcome: string }>();
+    expect(audits.results).toEqual([
+      { action: "user.remove", outcome: "success" },
+      { action: "user.restore", outcome: "success" }
+    ]);
+  });
+
+  it("does not let a user remove themselves", async () => {
+    const owner = await env.DB.prepare('SELECT id FROM "user" WHERE email = ?')
+      .bind("owner@login.example")
+      .first<{ id: string }>();
+    const response = await SELF.fetch(`${origin}/api/users/${owner?.id}`, {
+      headers: { origin, cookie: ownerCookie },
+      method: "DELETE"
+    });
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "SELF_REMOVAL" }
+    });
+  });
+
+  it("requires an owner to remove or restore another owner", async () => {
+    const adminCreated = await createUser({
+      email: "user-admin@gmail.com",
+      method: "temporary_password",
+      name: "User Admin",
+      role: "admin"
+    });
+    const adminResult = (await adminCreated.json()) as {
+      temporaryPassword: string;
+    };
+    const pendingAdminCookie = await signIn("user-admin@gmail.com", adminResult.temporaryPassword);
+    const activatedAdmin = await SELF.fetch(`${origin}/api/me/password`, {
+      body: JSON.stringify({
+        confirmPassword: "user-admin-password-456",
+        currentPassword: adminResult.temporaryPassword,
+        newPassword: "user-admin-password-456"
+      }),
+      headers: { "content-type": "application/json", cookie: pendingAdminCookie, origin },
+      method: "POST"
+    });
+    expect(activatedAdmin.status, await activatedAdmin.clone().text()).toBe(200);
+    const adminCookie = extractSessionCookie(activatedAdmin);
+
+    const ownerCreated = await createUser({
+      email: "second-owner@gmail.com",
+      method: "temporary_password",
+      name: "Second Owner",
+      role: "owner"
+    });
+    const ownerResult = (await ownerCreated.json()) as { user: { id: string } };
+    const deniedRemoval = await SELF.fetch(`${origin}/api/users/${ownerResult.user.id}`, {
+      headers: { origin, cookie: adminCookie },
+      method: "DELETE"
+    });
+    expect(deniedRemoval.status).toBe(403);
+    await expect(deniedRemoval.json()).resolves.toMatchObject({
+      error: { code: "OWNER_REQUIRED" }
+    });
+
+    const removed = await SELF.fetch(`${origin}/api/users/${ownerResult.user.id}`, {
+      headers: { origin, cookie: ownerCookie },
+      method: "DELETE"
+    });
+    expect(removed.status, await removed.clone().text()).toBe(204);
+    const deniedRestore = await SELF.fetch(`${origin}/api/users/${ownerResult.user.id}/restore`, {
+      headers: { origin, cookie: adminCookie },
+      method: "POST"
+    });
+    expect(deniedRestore.status).toBe(403);
+    await expect(deniedRestore.json()).resolves.toMatchObject({
+      error: { code: "OWNER_REQUIRED" }
+    });
+
+    const restored = await SELF.fetch(`${origin}/api/users/${ownerResult.user.id}/restore`, {
+      headers: { origin, cookie: ownerCookie },
+      method: "POST"
+    });
+    expect(restored.status, await restored.clone().text()).toBe(200);
+  });
+
+  it("prevents an admin from viewing or revoking owner sessions", async () => {
+    const adminEmail = "session-admin@login.example";
+    const created = await createAuth(env, new Request(`${origin}/api/auth/sign-up/email`)).handler(
+      new Request(`${origin}/api/auth/sign-up/email`, {
+        body: JSON.stringify({
+          email: adminEmail,
+          name: "Session Admin",
+          password: "session-admin-password",
+          rememberMe: false
+        }),
+        headers: { "content-type": "application/json", origin },
+        method: "POST"
+      })
+    );
+    expect(created.status, await created.clone().text()).toBe(200);
+    const adminCookie = extractSessionCookie(created);
+    await env.DB.prepare(`UPDATE "user" SET role = 'admin' WHERE email = ?`).bind(adminEmail).run();
+
+    const owner = await env.DB.prepare(`SELECT id FROM "user" WHERE role = 'owner'`).first<{
+      id: string;
+    }>();
+    const ownerSession = await env.DB.prepare(
+      `SELECT id FROM "session" WHERE userId = ? ORDER BY createdAt DESC LIMIT 1`
+    )
+      .bind(owner?.id)
+      .first<{ id: string }>();
+    if (!owner || !ownerSession) throw new Error("Owner session was not created.");
+
+    const listed = await SELF.fetch(`${origin}/api/sessions?userId=${owner.id}`, {
+      headers: { origin, cookie: adminCookie }
+    });
+    expect(listed.status).toBe(403);
+    await expect(listed.json()).resolves.toMatchObject({ error: { code: "OWNER_REQUIRED" } });
+
+    const revoked = await SELF.fetch(`${origin}/api/sessions/${ownerSession.id}`, {
+      headers: { origin, cookie: adminCookie },
+      method: "DELETE"
+    });
+    expect(revoked.status).toBe(403);
+    await expect(revoked.json()).resolves.toMatchObject({ error: { code: "OWNER_REQUIRED" } });
+
+    const ownerStillSignedIn = await SELF.fetch(`${origin}/api/me`, {
+      headers: { origin, cookie: ownerCookie }
+    });
+    expect(ownerStillSignedIn.status).toBe(200);
+  });
+});
+
+function createUser(input: {
+  email: string;
+  method: "email_invite" | "temporary_password";
+  name: string;
+  role: "owner" | "admin" | "member";
+}): Promise<Response> {
+  return SELF.fetch(`${origin}/api/users`, {
+    body: JSON.stringify(input),
+    headers: { "content-type": "application/json", cookie: ownerCookie, origin },
+    method: "POST"
+  });
+}
+
+function requestPasswordReset(email: string, redirectTo: string): Promise<Response> {
+  return SELF.fetch(`${origin}/api/auth/request-password-reset`, {
+    body: JSON.stringify({ email, redirectTo }),
+    headers: { "content-type": "application/json", origin },
+    method: "POST"
+  });
+}
+
+async function signIn(email: string, password: string): Promise<string> {
+  const response = await SELF.fetch(`${origin}/api/auth/sign-in/email`, {
+    body: JSON.stringify({ email, password, rememberMe: false }),
+    headers: { "content-type": "application/json", origin },
+    method: "POST"
+  });
+  if (!response.ok) throw new Error(await response.text());
+  return extractSessionCookie(response);
+}
+
+function extractSessionCookie(response: Response): string {
+  const serialized = response.headers.get("set-cookie") ?? "";
+  const match = serialized.match(/(?:^|,\s*)((?:__Secure-)?better-auth\.session_token=[^;,]+)/);
+  if (!match?.[1]) throw new Error("Session cookie was not returned.");
+  return match[1];
+}

@@ -1,0 +1,108 @@
+import * as React from "react";
+import { PiCheck, PiCopy, PiDownload, PiFileText } from "react-icons/pi";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/cn";
+
+export function AgentSkillDetails({
+  action,
+  description = "Install the skill or give its URL to an agent that can make HTTP requests.",
+  flat = false,
+  nextStep = "The agent reads the API and safety instructions, then gives you a short code and a link to approve in your normal browser. This URL grants no access and contains no account or mail data.",
+  skillUrl,
+  skillUrlId,
+  title = "Deployment-local Agent Skill"
+}: {
+  action?: React.ReactNode;
+  description?: string;
+  flat?: boolean;
+  nextStep?: string;
+  skillUrl: string;
+  skillUrlId: string;
+  title?: string;
+}): React.ReactElement {
+  const [copied, setCopied] = React.useState(false);
+
+  async function copyUrl(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(skillUrl);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-5 text-sm">
+      <section className={cn("flex flex-col gap-4", !flat && "rounded-lg border bg-muted/20 p-3")}>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex items-start gap-3">
+            <span
+              className={cn(
+                "mt-0.5 inline-flex size-8 shrink-0 items-center justify-center text-muted-foreground",
+                !flat && "rounded-md border bg-background"
+              )}
+            >
+              <PiFileText aria-hidden="true" className="size-4" />
+            </span>
+            <div className="min-w-0">
+              <h3 className="font-medium text-foreground">{title}</h3>
+              <p className="mt-0.5 text-xs text-muted-foreground">{description}</p>
+            </div>
+          </div>
+          {action ? <div className="shrink-0">{action}</div> : null}
+        </div>
+
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+          <label className="sr-only" htmlFor={skillUrlId}>
+            Agent Skill URL
+          </label>
+          <Input
+            aria-label="Agent Skill URL"
+            className="min-w-0 font-mono text-base max-sm:h-[38px] sm:text-xs"
+            id={skillUrlId}
+            readOnly
+            size="sm"
+            value={skillUrl}
+            onFocus={(event) => event.currentTarget.select()}
+          />
+          <div className="grid grid-cols-2 gap-2 sm:flex sm:shrink-0">
+            <Button
+              aria-label="Copy Agent Skill URL"
+              className="max-sm:h-[38px] max-sm:min-h-[38px]"
+              onClick={() => void copyUrl()}
+              type="button"
+              variant="outline"
+            >
+              {copied ? (
+                <PiCheck aria-hidden="true" data-icon="inline-start" />
+              ) : (
+                <PiCopy aria-hidden="true" data-icon="inline-start" />
+              )}
+              {copied ? "Copied" : "Copy URL"}
+            </Button>
+            <Button asChild className="max-sm:h-[38px] max-sm:min-h-[38px]" variant="outline">
+              <a download="SKILL.md" href={skillUrl}>
+                <PiDownload aria-hidden="true" data-icon="inline-start" />
+                Download Skill
+              </a>
+            </Button>
+          </div>
+        </div>
+      </section>
+
+      {nextStep ? (
+        <section
+          className={cn(
+            "flex flex-col gap-1 text-xs leading-4 text-muted-foreground",
+            !flat && "rounded-lg border px-3 py-2.5"
+          )}
+        >
+          <p className="font-medium text-foreground">What happens next</p>
+          <p>{nextStep}</p>
+        </section>
+      ) : null}
+    </div>
+  );
+}

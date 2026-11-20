@@ -1,0 +1,340 @@
+import * as React from "react";
+import { PiArrowLeft } from "react-icons/pi";
+
+import { Button } from "@/components/ui/button";
+import { setConversationLabel } from "@/features/labels/api";
+import { LabelFilter } from "@/features/labels/label-filter";
+import type { MailLabel } from "@/features/labels/types";
+import type { Mailbox } from "@/features/mailboxes/types";
+import { getMessageThread, runConversationAction, runMessageAction } from "@/features/messages/api";
+import { MailListHeader } from "@/features/messages/mail-list-layout";
+import { MessageDetail } from "@/features/messages/message-detail";
+import { MessageList } from "@/features/messages/message-list";
+import type {
+  ConversationAction,
+  ConversationSummary,
+  MessageDetail as MessageDetailType
+} from "@/features/messages/types";
+import { type MailFolderId, mailFolders } from "@/lib/routes";
+import { CatchAllPolicyNotice } from "./catch-all-policy-notice";
+
+type InboxPageProps = {
+  activeFolder: MailFolderId;
+  conversations: ConversationSummary[];
+  defaultFromMailboxId: string | null;
+  hasMore: boolean;
+  isLoadingMore: boolean;
+  labelIds?: readonly string[];
+  labels?: MailLabel[];
+  loadMoreError: string | null;
+  mailboxes: Mailbox[];
+  selectedId: string | null;
+  onDraftsChange?: () => void;
+  onConversationAction: (threadId: string, action: ConversationAction, affected: number) => void;
+  onConversationLabelsChange?: (threadId: string, labels: MailLabel[]) => void;
+  onLoadMore: () => void;
+  onLabelChange?: (labelIds: string[]) => void;
+  onRefresh: () => Promise<void> | void;
+  onMessageRouteChange: (folder: MailFolderId, messageId: string | null) => void;
+  onSelect: (messageId: string) => void;
+  totalCount: number | null;
+  canCreateLabels?: boolean;
+  canOrganizeConversation?: (mailboxId: string | null) => boolean;
+  onLabelsChanged?: (() => Promise<void>) | undefined;
+};
+
+export function InboxPage({
+  activeFolder,
+  conversations,
+  defaultFromMailboxId,
+  hasMore,
+  isLoadingMore,
+  labelIds = [],
+  labels = [],
+  loadMoreError,
+  mailboxes,
+  selectedId,
+  onDraftsChange,
+  onConversationAction,
+  onConversationLabelsChange = () => undefined,
+  onLoadMore,
+  onLabelChange = () => undefined,
+  onRefresh,
+  onMessageRouteChange,
+  onSelect,
+  totalCount,
+  canCreateLabels = false,
+  onLabelsChanged,
+  canOrganizeConversation = () => false
+}: InboxPageProps): React.ReactElement {
+  const activeLabel = mailFolders.find((folder) => folder.id === activeFolder)?.label ?? "Messages";
+  const conversationCountLabel =
+    totalCount === null
+      ? null
+      : `${totalCount.toLocaleString()} ${totalCount === 1 ? "conversation" : "conversations"}`;
+  const [thread, setThread] = React.useState<MessageDetailType[]>([]);
+  const [detailError, setDetailError] = React.useState<string | null>(null);
+  const [detailLoading, setDetailLoading] = React.useState(false);
+  const threadLoadRequestRef = React.useRef(0);
+  const committedThreadContextRef = React.useRef({ activeFolder, selectedId });
+  const onRefreshRef = React.useRef(onRefresh);
+  const onMessageRouteChangeRef = React.useRef(onMessageRouteChange);
+  React.useLayoutEffect(() => {
+    committedThreadContextRef.current = { activeFolder, selectedId };
+  }, [activeFolder, selectedId]);
+  React.useEffect(() => {
+    onRefreshRef.current = onRefresh;
+  }, [onRefresh]);
+  React.useEffect(() => {
+    onMessageRouteChangeRef.current = onMessageRouteChange;
+  }, [onMessageRouteChange]);
+
+  const loadThread = React.useCallback(
+    async (messageId: string) => {
+      const requestId = ++threadLoadRequestRef.current;
+      const context = committedThreadContextRef.current;
+      const messages = visibleThreadMessages(await getMessageThread(messageId), activeFolder);
+      if (
+        requestId !== threadLoadRequestRef.current ||
+        context !== committedThreadContextRef.current
+      ) {
+        return null;
+      }
+      setThread(messages);
+      return messages;
+    },
+    [activeFolder]
+  );
+
+  React.useEffect(() => {
+    if (!selectedId) {
+      setThread([]);
+      setDetailError(null);
+      setDetailLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setThread([]);
+    setDetailError(null);
+    setDetailLoading(true);
+    void getMessageThread(selectedId)
+      .then((messages) => {
+        if (cancelled) return;
+        const visibleMessages = visibleThreadMessages(messages, activeFolder);
+        setThread(visibleMessages);
+        if (visibleMessages.length === 0) {
+          onMessageRouteChangeRef.current(activeFolder, null);
+          return;
+        }
+        if (
+          visibleMessages.some(
+            (message) => message.direction === "inbound" && message.readAt === null
+          )
+        ) {
+          void runConversationAction(selectedId, "read", activeFolder)
+            .then((updated) => {
+              if (cancelled) return;
+              onConversationAction(updated.threadId, "read", updated.affected);
+              if (updated.affected > 0) {
+                setThread((current) =>
+                  current.map((message) =>
+                    message.direction === "inbound"
+                      ? { ...message, readAt: new Date().toISOString() }
+                      : message
+                  )
+                );
+              }
+              onRefreshRef.current();
+            })
+            .catch(() => undefined);
+        }
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setDetailError(error instanceof Error ? error.message : "Message could not be opened.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setDetailLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeFolder, onConversationAction, selectedId]);
+
+  const selectedThreadId =
+    thread[0]?.threadId ??
+    conversations.find((conversation) => conversation.id === selectedId)?.threadId ??
+    null;
+  const selectedConversation = conversations.find(
+    (conversation) => conversation.threadId === selectedThreadId
+  );
+  const readerSelectedId = selectedConversation?.id ?? selectedId;
+  const selectedMailboxId = selectedConversation?.mailboxId ?? thread.at(-1)?.mailboxId ?? null;
+
+  React.useEffect(() => {
+    if (
+      !selectedId ||
+      !selectedConversation ||
+      thread.some((message) => message.id === selectedConversation.id)
+    ) {
+      return;
+    }
+    void loadThread(selectedConversation.id);
+  }, [loadThread, selectedConversation, selectedId, thread]);
+
+  const handleStarToggle = React.useCallback(
+    async (conversation: ConversationSummary) => {
+      const action = conversation.isStarred ? "unstar" : "star";
+      try {
+        const updated = await runConversationAction(conversation.id, action, activeFolder);
+        onConversationAction(updated.threadId, action, updated.affected);
+        void Promise.resolve(onRefresh()).catch(() => undefined);
+      } catch {
+        // keep row state unchanged on failure; refresh will reconcile
+      }
+    },
+    [activeFolder, onConversationAction, onRefresh]
+  );
+
+  async function handleAction(action: Parameters<typeof runConversationAction>[1]) {
+    if (!selectedId) return;
+    const updated = await runConversationAction(selectedId, action, activeFolder);
+    onConversationAction(updated.threadId, action, updated.affected);
+    void Promise.resolve(onRefresh()).catch(() => undefined);
+    if (
+      action === "archive" ||
+      action === "unarchive" ||
+      action === "trash" ||
+      action === "restore" ||
+      (activeFolder === "starred" && action === "unstar")
+    ) {
+      onMessageRouteChange(activeFolder, null);
+      return;
+    }
+    await loadThread(selectedId);
+  }
+  if (selectedId) {
+    return (
+      <div className="flex h-full flex-col bg-reader">
+        {(detailLoading || thread.length === 0) && !detailError ? (
+          <div className="flex h-full flex-col">
+            <div className="shrink-0 border-b border-divider bg-toolbar px-3 sm:px-5">
+              <div className="relative flex h-11 items-center gap-2 py-2">
+                <Button
+                  aria-label="Back to messages"
+                  className="size-10 min-h-10 min-w-10 shrink-0 bg-transparent text-tertiary [@media(hover:hover)]:hover:bg-selected [@media(hover:hover)]:hover:text-foreground"
+                  onClick={() => onMessageRouteChange(activeFolder, null)}
+                  size="icon"
+                  type="button"
+                  variant="ghost"
+                >
+                  <PiArrowLeft aria-hidden="true" className="pointer-events-none size-3.5" />
+                </Button>
+                <span className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <span
+                    className="pointer-events-none size-4 rounded-full border-2 border-muted-foreground/20 border-t-foreground animate-spin"
+                    aria-hidden="true"
+                  />
+                  Loading conversation…
+                </span>
+              </div>
+            </div>
+            <div className="flex flex-1 items-center justify-center p-8">
+              <span
+                className="pointer-events-none size-5 rounded-full border-2 border-muted-foreground/20 border-t-foreground animate-spin"
+                aria-hidden="true"
+              />
+            </div>
+          </div>
+        ) : (
+          <MessageDetail
+            activeFolder={activeFolder}
+            defaultFromMailboxId={defaultFromMailboxId}
+            error={detailError}
+            isLoading={detailLoading}
+            key={selectedId}
+            canOrganizeLabels={canOrganizeConversation(selectedMailboxId)}
+            canCreateLabels={canCreateLabels}
+            labels={labels}
+            onLabelsChanged={onLabelsChanged}
+            mailboxes={mailboxes}
+            messages={thread}
+            routeMessageId={selectedId}
+            selectedId={readerSelectedId}
+            showBack
+            onAction={handleAction}
+            onMessageAction={async (message, action) => {
+              await runMessageAction(message.id, action);
+              await onRefresh();
+              const visibleMessages = await loadThread(selectedId);
+              if (visibleMessages?.length === 0) onMessageRouteChange(activeFolder, null);
+            }}
+            onBack={() => onMessageRouteChange(activeFolder, null)}
+            {...(onDraftsChange ? { onDraftsChange } : {})}
+            onRefresh={async () => {
+              await onRefresh();
+              if (selectedId) await loadThread(selectedId);
+            }}
+            onToggleLabel={async (label, assigned) => {
+              const result = await setConversationLabel(
+                readerSelectedId ?? selectedId,
+                label.id,
+                assigned
+              );
+              onConversationLabelsChange(result.threadId, result.labels);
+              await onRefresh();
+              await loadThread(selectedId);
+            }}
+            onSent={() => {
+              void Promise.resolve(onRefresh()).catch(() => undefined);
+              if (selectedId) void loadThread(selectedId);
+            }}
+          />
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full flex-col bg-list" data-mobile-view="message-list">
+      <MailListHeader
+        actions={<LabelFilter labels={labels} values={labelIds} onChange={onLabelChange} />}
+        countLabel={conversationCountLabel}
+        title={activeLabel}
+      />
+      {activeFolder === "catchall" ? <CatchAllPolicyNotice /> : null}
+      <div className="min-h-0 flex-1 overflow-hidden">
+        <MessageList
+          activeFolder={activeFolder}
+          conversations={conversations}
+          hasMore={hasMore}
+          isLoadingMore={isLoadingMore}
+          loadMoreError={loadMoreError}
+          selectedThreadId={selectedThreadId}
+          onLoadMore={onLoadMore}
+          onRefresh={onRefresh}
+          onSelect={(conversation) => onSelect(conversation.id)}
+          onToggleStar={handleStarToggle}
+          onToggleLabel={async (conversation, label, assigned) => {
+            const result = await setConversationLabel(conversation.id, label.id, assigned);
+            onConversationLabelsChange(result.threadId, result.labels);
+            await onRefresh();
+          }}
+          canOrganizeConversation={canOrganizeConversation}
+          canCreateLabels={canCreateLabels}
+          labels={labels}
+          onLabelsChanged={onLabelsChanged}
+        />
+      </div>
+    </div>
+  );
+}
+
+function visibleThreadMessages(
+  messages: MessageDetailType[],
+  activeFolder: MailFolderId
+): MessageDetailType[] {
+  const showsTrash = activeFolder === "trash";
+  return messages.filter((message) => (message.folder === "trash") === showsTrash);
+}

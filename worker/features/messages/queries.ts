@@ -1,0 +1,328 @@
+import { and, eq, type SQL, sql } from "drizzle-orm";
+
+import type { MessageScope } from "../../auth/mailbox-access";
+import { messageScopeCondition } from "../../auth/mailbox-access";
+import { nowIso } from "../../db/client";
+import { createDatabase, getRow, getRows } from "../../db/drizzle";
+import { messageAttachments, messages as messagesTable } from "../../db/schema";
+import { AppError } from "../../lib/errors";
+import type { MessageAction } from "./actions";
+import { buildMessageActionPatch } from "./actions";
+import { decodeKeysetCursor, encodeKeysetCursor, type KeysetCursor } from "./keyset-cursor";
+import { literalContains } from "./search";
+import { attachmentValues, messageValues } from "./storage";
+import { loadMessageText } from "./text-storage";
+import type {
+  AttachmentRow,
+  InsertAttachmentInput,
+  InsertMessageInput,
+  MessageDetail,
+  MessageRow,
+  MessageSummary,
+  StoredAttachment
+} from "./types";
+
+const messageSelect = sql`SELECT messages.* FROM messages`;
+
+/** Message cursors are versioned separately from conversation cursors. */
+const messageCursorVersion = "m1";
+export const defaultMessageLimit = 100;
+export const maxMessageLimit = 100;
+
+export type ListMessageFilters = {
+  cursor?: string | undefined;
+  folder?: string | undefined;
+  labelId?: string | undefined;
+  labelIds?: readonly string[] | undefined;
+  limit?: number | undefined;
+  mailboxId?: string | undefined;
+  search?: string | undefined;
+  scope: MessageScope;
+};
+
+export type MessagePage = {
+  messages: MessageSummary[];
+  nextCursor: string | null;
+};
+
+function decodeMessageCursor(value: string): KeysetCursor {
+  const cursor = decodeKeysetCursor(messageCursorVersion, value);
+  if (!cursor) {
+    throw new AppError("INVALID_CURSOR", "Message cursor is invalid.", 400);
+  }
+  return cursor;
+}
+
+export async function insertMessage(
+  db: D1Database,
+  input: InsertMessageInput
+): Promise<MessageSummary> {
+  const values = messageValues(input);
+  const id = values.id;
+  await createDatabase(db).insert(messagesTable).values(values).run();
+
+  const row = await getMessageRow(db, id);
+  if (!row) {
+    throw new AppError("MESSAGE_INSERT_FAILED", "Message could not be stored.", 500);
+  }
+  return mapMessageSummary(row);
+}
+
+export async function insertAttachment(
+  db: D1Database,
+  input: InsertAttachmentInput
+): Promise<StoredAttachment> {
+  const values = attachmentValues(input);
+  await createDatabase(db).insert(messageAttachments).values(values).run();
+  return values;
+}
+
+export async function listMessages(
+  db: D1Database,
+  filters: ListMessageFilters
+): Promise<MessageSummary[]> {
+  return (await listMessagePage(db, filters)).messages;
+}
+
+export async function listMessagePage(
+  db: D1Database,
+  filters: ListMessageFilters
+): Promise<MessagePage> {
+  const where: SQL[] = [];
+
+  // The access filter is applied first and is never relaxed by a cursor.
+  const scope = messageScopeCondition(filters.scope, "mailbox_id", "is_unassigned");
+  if (!scope) return { messages: [], nextCursor: null };
+  where.push(scope);
+
+  if (filters.folder) {
+    where.push(sql`folder = ${filters.folder}`);
+  }
+  if (filters.mailboxId) {
+    where.push(sql`mailbox_id = ${filters.mailboxId}`);
+  }
+  if (filters.search) {
+    where.push(
+      sql`(${literalContains(sql`subject`, filters.search)}
+           OR ${literalContains(sql`from_address`, filters.search)}
+           OR ${literalContains(sql`from_name`, filters.search)}
+           OR ${literalContains(sql`to_json`, filters.search)}
+           OR ${literalContains(sql`snippet`, filters.search)}
+           OR ${literalContains(sql`text_body`, filters.search)})`
+    );
+  }
+  const labelIds = filters.labelIds ?? (filters.labelId ? [filters.labelId] : []);
+  for (const labelId of labelIds) {
+    where.push(sql`EXISTS (
+      SELECT 1 FROM message_labels assignment
+      WHERE assignment.message_id = messages.id AND assignment.label_id = ${labelId}
+    )`);
+  }
+
+  const cursor = filters.cursor ? decodeMessageCursor(filters.cursor) : null;
+  if (cursor) {
+    where.push(
+      sql`(COALESCE(received_at, sent_at, created_at) < ${cursor.activityAt}
+           OR (COALESCE(received_at, sent_at, created_at) = ${cursor.activityAt}
+               AND messages.id < ${cursor.id}))`
+    );
+  }
+
+  const limit = Math.min(Math.max(filters.limit ?? defaultMessageLimit, 1), maxMessageLimit);
+  // Read one extra row to learn whether another page exists.
+  const result = await getRows<MessageRow>(
+    db,
+    sql`${messageSelect}
+        WHERE ${sql.join(where, sql` AND `)}
+        ORDER BY COALESCE(received_at, sent_at, created_at) DESC, messages.id DESC
+        LIMIT ${limit + 1}`
+  );
+
+  const pageRows = result.slice(0, limit);
+  const finalRow = pageRows.at(-1);
+  return {
+    messages: pageRows.map(mapMessageSummary),
+    nextCursor:
+      result.length > limit && finalRow
+        ? encodeKeysetCursor(messageCursorVersion, {
+            activityAt: messageActivityOf(finalRow),
+            id: finalRow.id
+          })
+        : null
+  };
+}
+
+function messageActivityOf(row: MessageRow): string {
+  return row.received_at ?? row.sent_at ?? row.created_at;
+}
+
+export async function getMessageDetail(
+  db: D1Database,
+  id: string,
+  bucket?: R2Bucket
+): Promise<MessageDetail | null> {
+  const row = await getMessageRow(db, id);
+  if (!row) {
+    return null;
+  }
+
+  return mapMessageDetail(db, row, bucket);
+}
+
+export async function listThreadMessages(
+  db: D1Database,
+  threadId: string,
+  scope: MessageScope,
+  bucket?: R2Bucket
+): Promise<MessageDetail[]> {
+  const scopeCondition = messageScopeCondition(scope, "mailbox_id", "is_unassigned");
+  if (!scopeCondition) return [];
+  const rows = await getRows<MessageRow>(
+    db,
+    sql`${messageSelect}
+       WHERE thread_id = ${threadId} AND ${scopeCondition}
+       ORDER BY COALESCE(received_at, sent_at, created_at) ASC`
+  );
+  return Promise.all(rows.map((row) => mapMessageDetail(db, row, bucket)));
+}
+
+async function mapMessageDetail(
+  db: D1Database,
+  row: MessageRow,
+  bucket?: R2Bucket
+): Promise<MessageDetail> {
+  return {
+    ...mapMessageSummary(row),
+    cc: parseJsonList(row.cc_json),
+    bcc: parseJsonList(row.bcc_json),
+    deliveredToAddress: row.delivered_to_address,
+    replyTo: parseJsonList(row.reply_to_json ?? "[]"),
+    textBody: await loadMessageText(bucket, row.text_r2_key, row.text_body),
+    htmlAvailable: row.html_r2_key !== null,
+    messageId: row.message_id,
+    inReplyTo: row.in_reply_to,
+    references: parseJsonList(row.references_json),
+    attachments: await listAttachments(db, row.id)
+  };
+}
+
+export async function updateMessageAction(
+  db: D1Database,
+  id: string,
+  action: MessageAction
+): Promise<MessageSummary> {
+  const current = await getMessageRow(db, id);
+  if (!current) {
+    throw new AppError("MESSAGE_NOT_FOUND", "Message not found.", 404);
+  }
+  if (
+    (action === "unarchive" && current.folder !== "archived") ||
+    (action === "restore" && current.folder !== "trash")
+  ) {
+    return mapMessageSummary(current);
+  }
+
+  const timestamp = nowIso();
+  const patch = buildMessageActionPatch(action, timestamp, {
+    direction: current.direction,
+    isUnassigned: current.is_unassigned === 1
+  });
+  const expectedFolder =
+    action === "unarchive" ? "archived" : action === "restore" ? "trash" : null;
+  await createDatabase(db)
+    .update(messagesTable)
+    .set({
+      folder: patch.folder,
+      readAt: patch.readAt,
+      starredAt: patch.starredAt,
+      archivedAt: patch.archivedAt,
+      trashedAt: patch.trashedAt,
+      updatedAt: timestamp
+    })
+    .where(
+      expectedFolder
+        ? and(eq(messagesTable.id, id), eq(messagesTable.folder, expectedFolder))
+        : eq(messagesTable.id, id)
+    )
+    .run();
+
+  const row = await getMessageRow(db, id);
+  if (!row) {
+    throw new AppError("MESSAGE_NOT_FOUND", "Message not found.", 404);
+  }
+  return mapMessageSummary(row);
+}
+
+export async function findAttachment(db: D1Database, id: string): Promise<StoredAttachment | null> {
+  const row = await getRow<AttachmentRow>(
+    db,
+    sql`SELECT * FROM message_attachments WHERE id = ${id}`
+  );
+
+  return row ? mapAttachment(row) : null;
+}
+
+export async function getMessageHtmlKey(db: D1Database, id: string): Promise<string | null> {
+  const row = await getRow<{ html_r2_key: string | null }>(
+    db,
+    sql`SELECT html_r2_key FROM messages WHERE id = ${id}`
+  );
+  return row?.html_r2_key ?? null;
+}
+
+async function getMessageRow(db: D1Database, id: string): Promise<MessageRow | null> {
+  return getRow<MessageRow>(db, sql`${messageSelect} WHERE messages.id = ${id}`);
+}
+
+async function listAttachments(db: D1Database, messageId: string): Promise<StoredAttachment[]> {
+  const rows = await getRows<AttachmentRow>(
+    db,
+    sql`SELECT * FROM message_attachments
+        WHERE message_id = ${messageId}
+        ORDER BY filename ASC`
+  );
+
+  return rows.map(mapAttachment);
+}
+
+export function mapMessageSummary(row: MessageRow): MessageSummary {
+  return {
+    id: row.id,
+    threadId: row.thread_id,
+    mailboxId: row.mailbox_id,
+    direction: row.direction,
+    folder: row.folder,
+    fromAddress: row.from_address,
+    fromName: row.from_name,
+    to: parseJsonList(row.to_json),
+    subject: row.subject,
+    snippet: row.snippet,
+    receivedAt: row.received_at,
+    sentAt: row.sent_at,
+    readAt: row.read_at,
+    starredAt: row.starred_at,
+    hasAttachments: row.has_attachments === 1,
+    createdAt: row.created_at
+  };
+}
+
+function mapAttachment(row: AttachmentRow): StoredAttachment {
+  return {
+    id: row.id,
+    messageId: row.message_id,
+    filename: row.filename,
+    contentType: row.content_type,
+    sizeBytes: row.size_bytes,
+    contentId: row.content_id,
+    disposition: row.disposition,
+    r2Key: row.r2_key,
+    createdAt: row.created_at
+  };
+}
+
+function parseJsonList(value: string): string[] {
+  const parsed = JSON.parse(value) as unknown;
+  return Array.isArray(parsed)
+    ? parsed.filter((item): item is string => typeof item === "string")
+    : [];
+}

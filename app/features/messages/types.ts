@@ -1,0 +1,81 @@
+type MessageFolder = "inbox" | "sent" | "archived" | "trash" | "catchall";
+
+import type { MailLabel } from "@/features/labels/types";
+
+export type MessageSummary = {
+  id: string;
+  threadId: string;
+  mailboxId: string | null;
+  direction: "inbound" | "outbound";
+  folder: MessageFolder;
+  fromAddress: string;
+  fromName?: string | null;
+  to: string[];
+  subject: string;
+  snippet: string;
+  receivedAt: string | null;
+  sentAt: string | null;
+  readAt: string | null;
+  starredAt: string | null;
+  hasAttachments: boolean;
+  labels?: MailLabel[];
+  createdAt: string;
+};
+
+export type ConversationSummary = MessageSummary & {
+  isStarred: boolean;
+  messageCount: number;
+  unreadCount: number;
+};
+
+export type ConversationPage = {
+  conversations: ConversationSummary[];
+  nextCursor: string | null;
+  totalCount: number | null;
+};
+
+export type ConversationAction =
+  | "read"
+  | "unread"
+  | "star"
+  | "unstar"
+  | "archive"
+  | "unarchive"
+  | "trash"
+  | "restore";
+
+export type MessageFolderAction = Extract<
+  ConversationAction,
+  "archive" | "unarchive" | "trash" | "restore"
+>;
+
+export type MessageDetail = MessageSummary & {
+  replyTo?: string[];
+  cc: string[];
+  bcc: string[];
+  deliveredToAddress: string | null;
+  textBody: string;
+  htmlAvailable: boolean;
+  messageId: string | null;
+  inReplyTo: string | null;
+  references: string[];
+  attachments: Array<{
+    id: string;
+    filename: string;
+    contentType: string;
+    sizeBytes: number;
+    contentId: string | null;
+    disposition: "attachment" | "inline";
+  }>;
+};
+
+export type MessageHtml = {
+  afterQuotedHtml: string | null;
+  afterQuotedHtmlHasRemoteImages: boolean;
+  hasRemoteImages: boolean;
+  html: string;
+  htmlHasRemoteImages: boolean;
+  quotedHtml: string | null;
+  quotedHtmlHasRemoteImages: boolean;
+  remoteMediaTrusted: boolean;
+};
